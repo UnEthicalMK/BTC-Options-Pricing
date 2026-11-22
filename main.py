@@ -1,339 +1,171 @@
 import os
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import xgboost as xgb
 from src import config
-from src.data_fetcher import fetch_historical_deribit_data
-from src.sanity_checks import run_sanity_checks
-from src.data_loader import clean_deribit_options_data, save_processed_data
-from src.features import engineer_features
-from src.baseline import vectorized_black_scholes
-from src.model import train_chronological_split, train_residual_model, compute_rmse
+from src.data_loader import extract_clean_btc_snapshot
+from src.baseline import (
+    vectorized_black_76,
+    vectorized_black_scholes,
+)
+from src.svi_model import calibrate_svi_surface
+from src.model import (
+    train_chronological_split,
+    train_microstructure_residual_model,
+)
+from src.sanity_checks import run_four_tier_sanity_checks
+from src.visualize import (
+    plot_svi_volatility_smiles,
+    plot_microstructure_importance,
+    plot_four_tier_comparison,
+)
 
-# Set professional plotting style for matplotlib / seaborn
-sns.set_theme(style="whitegrid", palette="muted")
-plt.rcParams.update({'figure.dpi': 300, 'savefig.dpi': 300})
 
-print("==================================================")
-print("INITIALIZING: Hybrid Options Engine & Plotting Pipeline")
-print("==================================================")
+def run_pipeline():
+    print("=" * 65)
+    print("  INITIALIZING: Deribit BTC Options True Hybrid Pricing Engine")
+    print("       (Black-76 + SVI Surface + XGBoost Microstructure)")
+    print("=" * 65)
 
-target_file = "deribit_options_chain_2024-01-01_OPTIONS.csv.gz"
-raw_path = os.path.join(config.RAW_DATA_DIR, target_file)
+    # ------------------------------------------------------------------ #
+    # Step 1: Ingest & Clean BTC 08:00 UTC Snapshot                      #
+    # ------------------------------------------------------------------ #
+    print("\n[1/6] Loading clean BTC settlement snapshot (08:00 UTC)...")
+    df = extract_clean_btc_snapshot()
+    print(f"  Loaded {len(df):,} valid Bitcoin options across {df['expiry_str'].nunique()} maturities.")
+    print(f"  BTC Forward Price Range: ${df['underlying_price'].min():,.2f} – ${df['underlying_price'].max():,.2f}")
 
-def validate_put_call_parity():
-    """
-    Mathematical validation of the Black-Scholes implementation.
+    # ------------------------------------------------------------------ #
+    # Step 2: Tier 0 & Tier 1 Analytical Baselines                       #
+    # ------------------------------------------------------------------ #
+    print("\n[2/6] Evaluating Analytical Benchmarks (Tier 0 & Tier 1)...")
 
-    Put-Call Parity:
-
-    C - P = S - K exp(-rT)
-
-    If the BS implementation is correct, parity errors should
-    be near machine precision.
-    """
-
-    print("\n" + "=" * 60)
-    print("PUT-CALL PARITY VALIDATION")
-    print("=" * 60)
-
-    np.random.seed(42)
-
-    N = 100_000
-
-    S = np.random.uniform(10000, 70000, N)
-    K = np.random.uniform(10000, 70000, N)
-    T = np.random.uniform(1/365, 2.0, N)
-
-    sigma = np.random.uniform(0.20, 1.00, N)
-
-    call_prices = vectorized_black_scholes(
-        S=S,
-        K=K,
-        T=T,
-        r=config.RISK_FREE_RATE,
-        sigma=sigma,
-        option_type="call"
+    # Tier 0: Naive Legacy Black-Scholes (r = 0.05, constant 40% historical vol)
+    # Applied to spot price with cash discounting
+    df['bs_legacy_price'] = vectorized_black_scholes(
+        S=df['underlying_price'].values,
+        K=df['strike'].values,
+        T=df['T'].values,
+        r=config.LEGACY_RISK_FREE_RATE,
+        sigma=0.40,
+        option_type='call'
     )
+    put_mask = df['option_type'].str.lower() == 'put'
+    if put_mask.any():
+        df.loc[put_mask, 'bs_legacy_price'] = vectorized_black_scholes(
+            S=df.loc[put_mask, 'underlying_price'].values,
+            K=df.loc[put_mask, 'strike'].values,
+            T=df.loc[put_mask, 'T'].values,
+            r=config.LEGACY_RISK_FREE_RATE,
+            sigma=0.40,
+            option_type='put'
+        )
 
-    put_prices = vectorized_black_scholes(
-        S=S,
-        K=K,
-        T=T,
-        r=config.RISK_FREE_RATE,
-        sigma=sigma,
-        option_type="put"
+    # Tier 1: Black-76 with Flat ATM Volatility per Expiry Slice
+    # Find ATM contract for each expiry (closest to k = 0)
+    atm_vols = df.groupby('expiry_str').apply(
+        lambda g: g.loc[g['log_moneyness'].abs().idxmin(), 'implied_vol']
+    ).to_dict()
+    df['atm_iv'] = df['expiry_str'].map(atm_vols)
+
+    df['b76_flat_price'] = vectorized_black_76(
+        F=df['underlying_price'].values,
+        K=df['strike'].values,
+        T=df['T'].values,
+        sigma=df['atm_iv'].values,
+        option_type='call'
     )
+    if put_mask.any():
+        df.loc[put_mask, 'b76_flat_price'] = vectorized_black_76(
+            F=df.loc[put_mask, 'underlying_price'].values,
+            K=df.loc[put_mask, 'strike'].values,
+            T=df.loc[put_mask, 'T'].values,
+            sigma=df.loc[put_mask, 'atm_iv'].values,
+            option_type='put'
+        )
 
-    lhs = call_prices - put_prices
-    rhs = S - K * np.exp(-config.RISK_FREE_RATE * T)
+    # ------------------------------------------------------------------ #
+    # Step 3: Tier 2 Parametric SVI Volatility Surface                   #
+    # ------------------------------------------------------------------ #
+    print("\n[3/6] Calibrating SVI (Stochastic Volatility Inspired) Surface...")
+    calibrated_models, df = calibrate_svi_surface(df)
 
-    errors = lhs - rhs
+    for exp, res in calibrated_models.items():
+        p = res['params']
+        arb_str = "ARB-FREE" if res['is_arbitrage_free'] else "WARNING: ARB"
+        print(f"  Expiry {exp:<10} (T={res['T']*365.25:5.1f}d) | RMSVE: {res['rmsve']*100:5.2f}% | "
+              f"a={p['a']:6.3f}, b={p['b']:5.3f}, rho={p['rho']:6.3f} | [{arb_str}]")
 
-    print(f"Mean Error      : {np.mean(errors):.12f}")
-    print(f"Median Error    : {np.median(errors):.12f}")
-    print(f"Std Error       : {np.std(errors):.12f}")
-    print(f"Max Abs Error   : {np.max(np.abs(errors)):.12f}")
+    # ------------------------------------------------------------------ #
+    # Step 4: Tier 3 Machine Learning Microstructure Residual Regressor  #
+    # ------------------------------------------------------------------ #
+    print("\n[4/6] Training XGBoost Microstructure Residual Regressor...")
 
-    print("=" * 60)
+    # Target: Implied Volatility Residual
+    df['iv_residual_target'] = df['implied_vol'] - df['svi_iv']
 
-# ------------------------------------------------------------------ #
-# Step 0: Data guard                                                 #
-# ------------------------------------------------------------------ #
-if not os.path.exists(raw_path):
-    print("\n[0/6] Target dataset missing locally — fetching...")
-    downloaded_files = fetch_historical_deribit_data(
-        "2024-01-01",
-        "2024-01-02"
+    feature_cols = [
+        'log_moneyness',
+        'T',
+        'relative_spread',
+        'orderbook_imbalance',
+        'open_interest'
+    ]
+
+    train_df, val_df, test_df = train_chronological_split(df, train_ratio=0.70, val_ratio=0.15)
+
+    X_train, y_train = train_df[feature_cols], train_df['iv_residual_target'].values
+    X_val,   y_val   = val_df[feature_cols],   val_df['iv_residual_target'].values
+    X_test           = test_df[feature_cols]
+
+    xgb_model = train_microstructure_residual_model(X_train, y_train, X_val, y_val)
+
+    # Predict residual on entire dataset for complete surface representation
+    df['predicted_iv_residual'] = xgb_model.predict(df[feature_cols])
+    # Hybrid IV: SVI baseline + Microstructure correction (bounded strictly positive)
+    df['hybrid_iv'] = np.maximum(df['svi_iv'] + df['predicted_iv_residual'], 0.05)
+
+    # Evaluate Black-76 Hybrid Option Prices
+    df['hybrid_price'] = vectorized_black_76(
+        F=df['underlying_price'].values,
+        K=df['strike'].values,
+        T=df['T'].values,
+        sigma=df['hybrid_iv'].values,
+        option_type='call'
     )
-    target_file = os.path.basename(downloaded_files[0])
-    raw_path = downloaded_files[0]
-else:
-    print("\n[0/6] Verified: Raw historical data file found.")
+    if put_mask.any():
+        df.loc[put_mask, 'hybrid_price'] = vectorized_black_76(
+            F=df.loc[put_mask, 'underlying_price'].values,
+            K=df.loc[put_mask, 'strike'].values,
+            T=df.loc[put_mask, 'T'].values,
+            sigma=df.loc[put_mask, 'hybrid_iv'].values,
+            option_type='put'
+        )
 
-# ------------------------------------------------------------------ #
-# Step 1: Load & clean                                               #
-# ------------------------------------------------------------------ #
-validate_put_call_parity()
-print("\n[1/6] Loading and parsing market microstructure records...")
-raw_df = clean_deribit_options_data(target_file)
+    # Save model artifact
+    os.makedirs(config.MODEL_DIR, exist_ok=True)
+    model_save_path = os.path.join(config.MODEL_DIR, config.MODEL_FILE)
+    xgb_model.save_model(model_save_path)
+    print(f"  XGBoost residual model saved to {model_save_path}")
 
-# --- NEW MICROSTRUCTURE FILTER ---
-before_filter = len(raw_df)
+    # ------------------------------------------------------------------ #
+    # Step 5: Quantitative Sanity Checks & 4-Tier Benchmark Report       #
+    # ------------------------------------------------------------------ #
+    print("\n[5/6] Running 4-Tier Quantitative Benchmark Report...")
+    metrics = run_four_tier_sanity_checks(df)
 
-# 1. Calculate the raw BTC spread
-raw_df['raw_btc_spread'] = raw_df['best_ask'] - raw_df['best_bid']
+    # ------------------------------------------------------------------ #
+    # Step 6: Diagnostic Visualization Suite                             #
+    # ------------------------------------------------------------------ #
+    print("\n[6/6] Generating High-Resolution Diagnostic Plots...")
+    plot_svi_volatility_smiles(df, calibrated_models)
+    plot_microstructure_importance(xgb_model, feature_cols)
+    plot_four_tier_comparison(metrics)
 
-# 2. Drop dummy asks (spreads wider than 0.05 BTC) and dust bids (< 0.0005 BTC)
-raw_df = raw_df[
-    (raw_df['raw_btc_spread'] < 0.05) & 
-    (raw_df['best_bid'] > 0.0005)
-].reset_index(drop=True)
+    print("\n" + "=" * 65)
+    print("  PIPELINE EXECUTION COMPLETED SUCCESSFULLY!")
+    print(f"  All figures saved to: {config.FIGURES_DIR}")
+    print("=" * 65)
 
-print(f"  Microstructure filter removed {before_filter - len(raw_df):,} dummy quotes.")
 
-# 3. NOW it is safe to convert to USD
-raw_df['market_mid'] = ((raw_df['best_bid'] + raw_df['best_ask']) / 2.0) * raw_df['underlying_price']
-raw_df['bid_ask_spread'] = raw_df['raw_btc_spread'] * raw_df['underlying_price']
-
-# ------------------------------------------------------------------ #
-# Step 2: Feature engineering                                        #
-# ------------------------------------------------------------------ #
-print("[2/6] Building feature matrix and analytical Greeks...")
-feat_df = engineer_features(raw_df)
-
-# DATA QUALITY FIX: Apply the MIN/MAX delta liquidity filter
-before = len(feat_df)
-feat_df = feat_df[
-    (feat_df['delta'].abs() >= config.MIN_DELTA) &
-    (feat_df['delta'].abs() <= config.MAX_DELTA)
-].reset_index(drop=True)
-print(f"  Delta filter removed {before - len(feat_df):,} extreme rows "
-      f"({len(feat_df):,} remaining).")
-
-# ------------------------------------------------------------------ #
-# Step 3: Black-Scholes baseline + residual target                    #
-# ------------------------------------------------------------------ #
-print("[3/6] Evaluating analytical Black-Scholes baseline model...")
-
-bs_prices = vectorized_black_scholes(
-    S=feat_df['underlying_price'].values,
-    K=feat_df['strike'].values,
-    T=feat_df['T'].values,
-    r=config.RISK_FREE_RATE,
-    sigma=feat_df['historical_volity'].values,
-    option_type="call",
-)
-
-is_put = feat_df['option_type'].str.lower() == 'put'
-if is_put.any():
-    put_prices = vectorized_black_scholes(
-        S=feat_df.loc[is_put, 'underlying_price'].values,
-        K=feat_df.loc[is_put, 'strike'].values,
-        T=feat_df.loc[is_put, 'T'].values,
-        r=config.RISK_FREE_RATE,
-        sigma=feat_df.loc[is_put, 'historical_volity'].values,
-        option_type="put",
-    )
-    bs_prices[is_put.values] = put_prices
-
-feat_df['bs_baseline_price'] = bs_prices
-
-# ==========================================================
-# Benchmark 2: Black-Scholes using Deribit implied volatility
-# ==========================================================
-
-print("\nIV DIAGNOSTICS")
-print(feat_df['mark_iv'].describe())
-print(feat_df['mark_iv'].head())
-
-# TEMPORARY assumption:
-# If diagnostics later show values like 75, keep /100.
-# If they show values like 0.75, remove /100.
-feat_df['implied_vol'] = feat_df['mark_iv'] / 100.0
-
-bs_iv_prices = vectorized_black_scholes(
-    S=feat_df['underlying_price'].values,
-    K=feat_df['strike'].values,
-    T=feat_df['T'].values,
-    r=config.RISK_FREE_RATE,
-    sigma=feat_df['implied_vol'].values,
-    option_type="call",
-)
-
-if is_put.any():
-    put_iv_prices = vectorized_black_scholes(
-        S=feat_df.loc[is_put, 'underlying_price'].values,
-        K=feat_df.loc[is_put, 'strike'].values,
-        T=feat_df.loc[is_put, 'T'].values,
-        r=config.RISK_FREE_RATE,
-        sigma=feat_df.loc[is_put, 'implied_vol'].values,
-        option_type="put",
-    )
-
-    bs_iv_prices[is_put.values] = put_iv_prices
-
-feat_df['bs_iv_price'] = bs_iv_prices
-run_sanity_checks(feat_df)
-
-feat_df['residual_target']   = feat_df['market_mid'] - feat_df['bs_baseline_price']
-
-save_processed_data(feat_df, "deribit_processed_features.csv")
-
-# ------------------------------------------------------------------ #
-# Step 4: Chronological split                                        #
-# ------------------------------------------------------------------ #
-print("[4/6] Constructing chronological partitions...")
-train_set, val_set, test_set = train_chronological_split(feat_df)
-
-features = [
-    'moneyness', 'T', 'historical_volity',
-    'delta', 'gamma', 'vega', 'bid_ask_spread',
-]
-
-X_train, y_train = train_set[features], train_set['residual_target'].values
-X_val,   y_val   = val_set[features],   val_set['residual_target'].values
-X_test,  y_test  = test_set[features],  test_set['residual_target'].values
-
-# ------------------------------------------------------------------ #
-# Step 5: Train residual model                                       #
-# ------------------------------------------------------------------ #
-print("[5/6] Training Gradient Boosted Residual Regressor...")
-ml_model = train_residual_model(X_train, y_train, X_val, y_val)
-
-os.makedirs(config.MODEL_DIR, exist_ok=True)
-ml_model.save_model(os.path.join(config.MODEL_DIR, "xgboost_residual_pricer.json"))
-
-# ------------------------------------------------------------------ #
-# Step 6: Performance Evaluation & Out-of-Sample Diagnostics          #
-# ------------------------------------------------------------------ #
-test_pred_residuals = ml_model.predict(X_test)
-hybrid_prices       = test_set['bs_baseline_price'].values + test_pred_residuals
-
-bs_rmse = compute_rmse(
-    test_set['market_mid'].values,
-    test_set['bs_baseline_price'].values
-)
-
-bs_iv_rmse = compute_rmse(
-    test_set['market_mid'].values,
-    test_set['bs_iv_price'].values
-)
-
-hybrid_rmse = compute_rmse(
-    test_set['market_mid'].values,
-    hybrid_prices
-)
-
-improvement = (bs_rmse - hybrid_rmse) / bs_rmse * 100
-
-print("\n" + "=" * 50)
-print("HYBRID PRICING ENGINE COMPLETED SUCCESSFULLY")
-print("=" * 50)
-print(f"Out-of-Sample BS(HV) RMSE      : {bs_rmse:.4f} USD")
-print(f"Out-of-Sample BS(IV) RMSE      : {bs_iv_rmse:.4f} USD")
-print(f"Out-of-Sample Hybrid RMSE      : {hybrid_rmse:.4f} USD")
-print(f"Structural Error Reduction     : {improvement:.2f}%")
-print("=" * 50)
-
-# ------------------------------------------------------------------ #
-# Step 7: Visual Diagnostic Plot Generation                          #
-# ------------------------------------------------------------------ #
-print("\n[6/6] Pipeline entering diagnostic visualization phase...")
-
-# Calculate predictions over the entire dataset for plotting consistency
-feat_df['predicted_residual'] = ml_model.predict(feat_df[features])
-feat_df['hybrid_price'] = feat_df['bs_baseline_price'] + feat_df['predicted_residual']
-feat_df['bs_error'] = feat_df['market_mid'] - feat_df['bs_baseline_price']
-feat_df['hybrid_error'] = feat_df['market_mid'] - feat_df['hybrid_price']
-
-fig_dir = os.path.join(config.ROOT_DIR, "figures")
-os.makedirs(fig_dir, exist_ok=True)
-
-# PLOT 1: Feature Importance Matrix
-print(" -> Generating Plot 1: Feature Importance Matrix...")
-plt.figure(figsize=(10, 6))
-importance_series = pd.Series(ml_model.feature_importances_, index=features).sort_values(ascending=True)
-importance_series.plot(kind='barh', color='steelblue')
-plt.title("XGBoost Feature Importance (Gain Weighting)", fontsize=14, pad=15)
-plt.xlabel("Relative Importance Score", fontsize=12)
-plt.ylabel("Engineered Market Features", fontsize=12)
-plt.tight_layout()
-plt.savefig(os.path.join(fig_dir, "01_feature_importance.png"))
-plt.close()
-
-# PLOT 2: Volatility Smile Correction (Error vs Moneyness)
-print(" -> Generating Plot 2: Volatility Smile Curve Correction...")
-smile_df = feat_df[(feat_df['T'] < 0.1) & (feat_df['moneyness'] > 0.8) & (feat_df['moneyness'] < 1.2)]
-
-plt.figure(figsize=(12, 7))
-sns.scatterplot(
-    x=smile_df['moneyness'], 
-    y=smile_df['bs_error'], 
-    alpha=0.4, label='Black-Scholes Error', color='crimson', s=15
-)
-sns.scatterplot(
-    x=smile_df['moneyness'], 
-    y=smile_df['hybrid_error'], 
-    alpha=0.4, label='Hybrid Model Error', color='mediumseagreen', s=15
-)
-plt.axhline(0, color='black', linestyle='--', linewidth=1.5)
-plt.title("Pricing Error vs. Moneyness (The Volatility Smile)", fontsize=14, pad=15)
-plt.xlabel("Moneyness (Spot Price / Strike Price)", fontsize=12)
-plt.ylabel("Pricing Error (Market Mid - Model Price) USD", fontsize=12)
-plt.legend(loc='upper right', fontsize=11, frameon=True)
-plt.tight_layout()
-plt.savefig(os.path.join(fig_dir, "02_volatility_smile_correction.png"))
-plt.close()
-
-# PLOT 3: Parity Curve (Actual vs. Predicted Prices)
-print(" -> Generating Plot 3: Model Parity Estimation...")
-plt.figure(figsize=(9, 9))
-
-max_val = min(feat_df['market_mid'].max(), 5000) 
-plt.plot([0, max_val], [0, max_val], color='black', linestyle='--', zorder=1, label="Perfect Prediction Line")
-
-plt.scatter(
-    feat_df['market_mid'], feat_df['bs_baseline_price'], 
-    alpha=0.3, color='crimson', s=10, label="Pure Black-Scholes", zorder=2
-)
-plt.scatter(
-    feat_df['market_mid'], feat_df['hybrid_price'], 
-    alpha=0.3, color='mediumseagreen', s=10, label="Hybrid Engine", zorder=3
-)
-
-plt.xlim(0, max_val)
-plt.ylim(0, max_val)
-plt.title("Model Predictions vs. Actual Market Mid-Prices", fontsize=14, pad=15)
-plt.xlabel("Actual Market Mid-Price (USD)", fontsize=12)
-plt.ylabel("Predicted Option Value (USD)", fontsize=12)
-plt.legend(loc='upper left', fontsize=11, frameon=True)
-plt.tight_layout()
-plt.savefig(os.path.join(fig_dir, "03_actual_vs_predicted.png"))
-plt.close()
-
-print("\n" + "=" * 50)
-print(f"ALL GRAPHICS EXPORTED: High-resolution PNG files saved to {fig_dir}/")
-print("==================================================")
+if __name__ == "__main__":
+    run_pipeline()

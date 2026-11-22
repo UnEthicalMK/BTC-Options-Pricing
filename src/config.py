@@ -8,29 +8,44 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 RAW_DATA_DIR = os.path.join(ROOT_DIR, "data", "raw")
 PROCESSED_DATA_DIR = os.path.join(ROOT_DIR, "data", "processed")
 MODEL_DIR = os.path.join(ROOT_DIR, "models")
+FIGURES_DIR = os.path.join(ROOT_DIR, "figures")
 
-# Financial & Data Filtering Constants
-RISK_FREE_RATE = 0.05  # 5% constant annualised risk-free rate
-MIN_DELTA = 0.10       # Drop extreme OTM options (|delta| < 0.10)
-MAX_DELTA = 0.90       # Drop extreme deep-ITM options (|delta| > 0.90)
+# Snapshot and Processed Filenames
+RAW_OPTIONS_FILE = "deribit_options_chain_2024-01-01_OPTIONS.csv.gz"
+SNAPSHOT_FILE = "btc_settlement_snapshot_20240101_0800.csv"
+MODEL_FILE = "xgboost_microstructure_residual.json"
 
-# Machine Learning Hyperparameters
-# subsample / colsample_bytree add stochastic regularisation to reduce overfitting.
-# reg_alpha (L1) and reg_lambda (L2) add weight regularisation.
-# early_stopping_rounds halts training when val loss stops improving, preventing
-# overfitting regardless of n_estimators ceiling.
-XGB_PARAMS = {
-    "max_depth": 4,
-    "learning_rate": 0.05,
-    "n_estimators": 500,          # raised ceiling; early stopping will find the optimum
+# Financial Constants
+# Deribit crypto options are inverse coin-margined referenced to forward/futures (Black-76).
+# Cash interest discounting is zero (r=0) because settlement occurs in cryptocurrency.
+BLACK76_RATE = 0.0
+
+# Legacy benchmark comparison constant
+LEGACY_RISK_FREE_RATE = 0.05
+
+# Filtering thresholds for liquid trading bounds
+MIN_DELTA = 0.05
+MAX_DELTA = 0.95
+
+# SVI Optimization Parameters
+SVI_PARAM_BOUNDS = (
+    [-1.0, 0.0001, -0.999, -2.0, 0.001],  # Lower: [a, b, rho, m, sigma]
+    [5.0,  5.0,     0.999,  2.0, 3.0]    # Upper: [a, b, rho, m, sigma]
+)
+
+# Machine Learning Hyperparameters (XGBoost for Microstructure Residual in IV Space)
+XGB_IV_PARAMS = {
+    "max_depth": 3,
+    "learning_rate": 0.03,
+    "n_estimators": 250,
     "objective": "reg:squarederror",
     "random_state": 42,
     "n_jobs": -1,
-    "subsample": 0.80,            # row subsampling per tree
-    "colsample_bytree": 0.80,     # feature subsampling per tree
-    "reg_alpha": 0.01,            # L1 regularisation
-    "reg_lambda": 1.0,            # L2 regularisation (XGBoost default is 1)
-    "min_child_weight": 5,        # minimum sum of instance weight in a leaf
+    "subsample": 0.80,
+    "colsample_bytree": 0.80,
+    "reg_alpha": 0.05,
+    "reg_lambda": 1.5,
+    "min_child_weight": 3,
 }
 
-EARLY_STOPPING_ROUNDS = 30       # stop if val RMSE hasn't improved for 30 rounds
+EARLY_STOPPING_ROUNDS = 25
