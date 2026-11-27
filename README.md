@@ -12,9 +12,9 @@ A quantitative derivatives pricing and volatility surface engine for Bitcoin (BT
 
 The engine addresses key challenges in crypto options pricing through a multi-tiered framework:
 - **Deribit-Native Black-76 ($r = 0$):** Handles inverse coin-margining and forward-referenced payoffs without cash discounting errors.
-- **SVI Volatility Surface:** Implements Jim Gatheral's Quasi-Explicit SVI model to guarantee static no-arbitrage across all expiries.
-- **Microstructure Residual Regressor (XGBoost):** Evaluates high-frequency order book features (depth imbalance, relative spread, open interest) in implied volatility space.
-- **4-Tier Quantitative Benchmark:** Compares textbook models against parametric surfaces and machine learning.
+- **Arbitrage-Free SVI Surface:** Sequential constrained calibration of Jim Gatheral's Raw SVI model enforcing butterfly convexity, Roger Lee moment bounds, and calendar monotonicity.
+- **Microstructure Residual Regressor (XGBoost):** Evaluates order book features (depth imbalance, relative spread, open interest) on strict out-of-sample holdouts in implied volatility space.
+- **4-Tier Quantitative Benchmark:** Compares naive Black-Scholes against Black-76, parametric SVI, and the hybrid ML engine.
 
 ---
 
@@ -35,33 +35,36 @@ $$w(k) = a + b \left( \rho (k - m) + \sqrt{(k - m)^2 + \sigma^2} \right)$$
 - **$\rho$:** Skewness / spot-vol correlation ($|\rho| < 1$)
 - **$m$:** Smile horizontal shift
 - **$\sigma$:** Smoothness at the money ($\sigma > 0$)
-- **No-Arbitrage Guarantee:** Checked via Breeden-Litzenberger density ($g(k) \ge 0$).
+- **No-Arbitrage Checks ($k \in [-1.0, +1.0]$):** Verified across all 11 slices for Breeden-Litzenberger density ($g(k) \ge 0$), Roger Lee bounds, and calendar monotonicity ($w_{i+1} \ge w_i$).
 
 ### Machine Learning Layer (XGBoost)
-Predicts the implied volatility residual: $\Delta \sigma = \sigma_{\text{market}} - \sigma_{\text{SVI}}$.
-- **Features:** Order book imbalance, relative bid-ask spread, open interest, moneyness $k$, and maturity $T$.
+Predicts the implied volatility residual $\Delta \sigma = \sigma_{\text{market}} - \sigma_{\text{SVI}}$ using order book imbalance, relative bid-ask spread, open interest, log-moneyness $k$, and maturity $T$, evaluated on a stratified 70/15/15 holdout split.
 
 ---
 
 ## 2. Benchmark Results
 
-Evaluated on **556 Deribit BTC options** across **11 expiration dates** (1-day to 1-year):
+Evaluated on **556 Deribit BTC options** across **11 expiration dates** (1-day to 1-year). Dollar pricing is benchmarked against Deribit's official mark price (`mark_usd`) since SVI calibrates to `mark_iv` (BBO `market_mid` RMSE is `$137.88` due to wide spreads on deep-ITM strikes).
 
-| Tier | Model Architecture | Volatility RMSVE | Pricing RMSE | Pricing MAPE | No-Arbitrage Guarantee |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| **Tier 0** | Naive Black-Scholes ($r=0.05, \sigma=40\%$) | 30.99% | \$1,726.34 | 59.55% | No (Violates parity & calendar) |
-| **Tier 1** | Black-76 with Flat ATM Volatility | 15.55% | \$221.49 | 24.70% | Partial (No skew modeling) |
-| **Tier 2** | **SVI Volatility Surface (Parametric)** | **1.08%** | **\$137.72** | **2.72%** | **100% Guaranteed** |
-| **Tier 3** | **Full Hybrid Engine (SVI + XGBoost)** | **1.07%** | **\$137.67** | **2.72%** | **100% Manifold Bound** |
+### Strict Out-of-Sample Holdout ($N = 89$, Stratified Test Set)
+
+| Tier | Model Architecture | Volatility RMSVE | Mark Price RMSE | Mark MAPE | No-Arbitrage Audit |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **Tier 0** | Naive Black-Scholes ($r=0.05, \sigma=40\%$) | 29.29% | \$1,591.47 | 55.84% | Violates forward parity |
+| **Tier 1** | Black-76 with Flat ATM Volatility | 13.38% | \$204.54 | 19.28% | No smile skew |
+| **Tier 2** | **SVI Volatility Surface (Parametric)** | **0.82%** | **\$17.04** | **1.27%** | **11/11 Butterfly, 0 Calendar Viol.** |
+| **Tier 3** | **Full Hybrid Engine (SVI + XGBoost OOS)** | **0.82%** | **\$20.75** | **1.36%** | **No formal guarantee** |
+
+*(Full-surface $N = 556$ Tier 2 SVI calibration: RMSVE `1.41%`, Mark RMSE `$14.32`.)*
 
 ---
 
 ## 3. Key Finding: Occam's Razor in Pricing
 
-- **The Strawman Baseline:** Training ML against a flawed Black-Scholes baseline ($\sigma=40\%, r=0.05$) creates an apparent "92% error reduction". In reality, the ML model is merely acting as a numerical multiplier to correct the baseline volatility level.
-- **SVI Dominance:** Once Gatheral's 5-parameter SVI model is calibrated with Black-76 ($r=0$), it captures **99% of the real market smile natively** in milliseconds (RMSVE: 1.08%, MAPE: 2.72%).
-- **XGBoost's Marginal Gain:** Adding XGBoost on top of SVI improves pricing by only **\$0.05** (\$137.72 to \$137.67).
-- **Takeaway:** In cross-sectional derivatives pricing, domain-specific financial physics dominate unconstrained machine learning. ML should complement, not substitute, sound financial modeling.
+- **The Strawman Baseline:** Benchmarking ML against naive Black-Scholes ($\sigma=40\%, r=0.05$) creates an illusion of massive error reduction where trees mostly approximate a Taylor expansion of volatility level.
+- **SVI Dominance:** Gatheral's 5-parameter SVI model with Black-76 ($r=0$) captures the volatility surface natively (**\$14.32** full-surface mark RMSE, **\$17.04** OOS) with **0 calendar or butterfly violations**.
+- **XGBoost Out-of-Sample Reality:** On a leakage-free stratified holdout, XGBoost early-stopping halts at iteration 0 and slightly degrades OOS pricing (**\$17.04** to **\$20.75** Mark RMSE).
+- **Takeaway:** In cross-sectional derivatives pricing, enforcing domain physics (forward discounting and arbitrage-free parametric geometry) strictly outperforms unconstrained gradient boosting.
 
 ---
 
@@ -69,19 +72,23 @@ Evaluated on **556 Deribit BTC options** across **11 expiration dates** (1-day t
 
 ```
 BTC_Option_Pricing/
-├── pyproject.toml              # Pytest configuration
-├── requirements.txt            # Dependencies
-├── main.py                     # Execution pipeline
+├── pyproject.toml              # Package & pytest configuration
+├── requirements.txt            # Compatible Python 3.10+ dependencies
+├── main.py                     # End-to-end execution pipeline
+├── data/samples/               # Tracked 08:00 UTC BTC snapshot for fresh clones
 ├── src/
 │   ├── baseline.py             # Black-76 (r=0) & Black-Scholes pricing
-│   ├── svi_model.py            # SVI calibration & arbitrage checks
-│   ├── data_loader.py          # Clean 08:00 UTC snapshot extraction
-│   ├── model.py                # XGBoost microstructure model
-│   ├── sanity_checks.py        # 4-tier benchmark metrics
+│   ├── config.py               # Paths, SVI bounds & ML hyperparameters
+│   ├── data_fetcher.py         # Tardis.dev dataset downloader
+│   ├── data_loader.py          # BTC-only snapshot extractor & sample fallback
+│   ├── svi_model.py            # Constrained SVI calibration & arbitrage checks
+│   ├── model.py                # Stratified split & XGBoost residual trainer
+│   ├── sanity_checks.py        # Benchmark metrics & verified arbitrage audit
 │   └── visualize.py            # Diagnostic plotting
 ├── tests/
 │   ├── test_baseline.py        # Parity & Greeks unit tests
-│   └── test_svi.py             # SVI bounds & density unit tests
+│   ├── test_svi.py             # SVI bounds, density & calendar tests
+│   └── test_pipeline.py        # Loader, split, XGBoost & audit tests
 └── figures/
     ├── 01_svi_volatility_smiles.png
     ├── 02_microstructure_feature_importance.png
@@ -101,22 +108,21 @@ pip install -r requirements.txt
 ```powershell
 pytest
 ```
-Expected: **9 passed** in under 4 seconds.
+Expected: **16 passed** in under 5 seconds.
 
 ### Run Pipeline
 ```powershell
 python main.py
 ```
-This loads the clean 08:00 UTC settlement snapshot, calibrates SVI across 11 expiries, trains the microstructure regressor, prints the benchmark report, and exports diagnostic plots to `figures/`.
+Loads the clean 08:00 UTC BTC snapshot (automatically falling back to `data/samples/` on fresh clones), calibrates SVI across 11 expiries, runs strict OOS XGBoost evaluation, verifies arbitrage bounds, and exports figures to `figures/`.
 
 ---
 
 ## 6. Visual Diagnostics
 
-High-resolution plots are exported to `figures/`:
-1. **`01_svi_volatility_smiles.png`:** SVI fitted smiles vs. market quotes across all 11 expiries.
-2. **`02_microstructure_feature_importance.png`:** Order book depth and spread attribution.
-3. **`03_four_tier_benchmark_comparison.png`:** Multi-tier RMSVE and Dollar RMSE comparison.
+1. **`01_svi_volatility_smiles.png`:** Arbitrage-free SVI smiles vs. Deribit mark IV across 11 expiries.
+2. **`02_microstructure_feature_importance.png`:** XGBoost gain attribution across features.
+3. **`03_four_tier_benchmark_comparison.png`:** Out-of-sample RMSVE and Mark-Price RMSE across all 4 tiers.
 
 ---
 
