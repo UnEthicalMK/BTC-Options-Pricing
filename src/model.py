@@ -2,23 +2,42 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 from src import config
-from src.baseline import vectorized_black_76
 
 
-def train_chronological_split(df: pd.DataFrame, train_ratio: float = 0.70, val_ratio: float = 0.15):
+def train_stratified_split(
+    df: pd.DataFrame,
+    group_col: str = "expiry_str",
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    random_state: int = config.RANDOM_STATE,
+):
     """
-    Splits the options dataset chronologically or stratified by moneyness/expiry.
-    Returns train, validation, and test slices.
+    Performs a reproducible stratified split across expiry slices so train,
+    validation, and test partitions each span the full maturity term structure.
     """
-    n = len(df)
-    train_end = int(n * train_ratio)
-    val_end = int(n * (train_ratio + val_ratio))
+    rng = np.random.default_rng(random_state)
+    train_idx, val_idx, test_idx = [], [], []
 
-    train_df = df.iloc[:train_end].copy()
-    val_df = df.iloc[train_end:val_end].copy()
-    test_df = df.iloc[val_end:].copy()
+    groups = df[group_col].unique() if group_col in df.columns else [None]
+    for grp in groups:
+        sub_idx = (
+            df.index[df[group_col] == grp].to_numpy().copy()
+            if grp is not None
+            else df.index.to_numpy().copy()
+        )
+        rng.shuffle(sub_idx)
+        n = len(sub_idx)
+        train_end = max(1, int(n * train_ratio)) if n >= 3 else n
+        val_end = max(train_end, int(n * (train_ratio + val_ratio))) if n >= 3 else n
+        train_idx.extend(sub_idx[:train_end])
+        val_idx.extend(sub_idx[train_end:val_end])
+        test_idx.extend(sub_idx[val_end:])
 
-    return train_df, val_df, test_df
+    return (
+        df.loc[train_idx].copy().reset_index(drop=True),
+        df.loc[val_idx].copy().reset_index(drop=True),
+        df.loc[test_idx].copy().reset_index(drop=True),
+    )
 
 
 def train_microstructure_residual_model(
@@ -30,23 +49,12 @@ def train_microstructure_residual_model(
     """
     Trains an XGBoost regressor to predict the implied volatility residual:
         Delta_sigma = sigma_market - sigma_SVI
-
-    Using genuine order book microstructure features:
-    - log_moneyness: ln(K / F)
-    - T: time to maturity
-    - relative_spread: (ask - bid) / mid
-    - orderbook_imbalance: (bid_depth - ask_depth) / total_depth
-    - open_interest: total outstanding contracts
-
-    Properly passes early_stopping_rounds to prevent overfitting.
+    using order book microstructure features with early stopping on validation loss.
     """
-    params = config.XGB_IV_PARAMS.copy()
-    
     model = XGBRegressor(
         early_stopping_rounds=config.EARLY_STOPPING_ROUNDS,
-        **params
+        **config.XGB_IV_PARAMS.copy(),
     )
-    
     model.fit(
         X_train,
         y_train,
@@ -59,7 +67,7 @@ def train_microstructure_residual_model(
 def compute_rmse(actual: np.ndarray, predicted: np.ndarray) -> float:
     actual = np.asarray(actual, dtype=float)
     predicted = np.asarray(predicted, dtype=float)
-    return float(np.sqrt(np.mean((actual - predicted)**2)))
+    return float(np.sqrt(np.mean((actual - predicted) ** 2)))
 
 
 def compute_mape(actual: np.ndarray, predicted: np.ndarray) -> float:
