@@ -1,102 +1,114 @@
 import numpy as np
 import pandas as pd
 from src.model import compute_rmse, compute_mape
+from src.svi_model import check_calendar_arbitrage
 
 
-def run_four_tier_sanity_checks(df: pd.DataFrame) -> dict:
+def _evaluate_tier_frame(df: pd.DataFrame, tier_specs: list[tuple[str, str, str]], target_col: str) -> dict:
+    """Computes RMSVE, Dollar RMSE, and MAPE for a list of (label, iv_col, price_col) specs."""
+    market_iv = df["implied_vol"].values
+    target_usd = df[target_col].values
+    results = {}
+
+    for label, iv_col, price_col in tier_specs:
+        iv_vals = np.full_like(market_iv, 0.40) if iv_col == "_CONST_40" else df[iv_col].values
+        price_vals = df[price_col].values
+        results[label] = {
+            "rmsve_pct": compute_rmse(market_iv, iv_vals) * 100.0,
+            "rmse_usd": compute_rmse(target_usd, price_vals),
+            "mape_pct": compute_mape(target_usd, price_vals),
+        }
+    return results
+
+
+def run_four_tier_sanity_checks(
+    full_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    calibrated_models: dict,
+) -> dict:
     """
-    Comprehensive quantitative sanity check report comparing the 4 model tiers:
-    - Tier 0: Naive Black-Scholes (r=0.05, sigma=0.40 constant)
-    - Tier 1: Black-76 with Flat ATM Implied Volatility (r=0)
-    - Tier 2: SVI Parametric Volatility Surface (r=0)
-    - Tier 3: Hybrid Engine (SVI + XGBoost Microstructure Residual)
-
-    Evaluates:
-    - Volatility RMSE (RMSVE in percentage vol points)
-    - Price RMSE (USD)
-    - Price MAPE (%)
-    - Put-Call Parity Maximum Absolute Error (USD)
+    Produces an honest, leakage-free quantitative benchmark report:
+    1. Full-surface calibration quality (Tiers 0–2 across all contracts) vs. both
+       Deribit official mark price (`mark_usd`) and BBO mid (`market_mid`).
+    2. Strict Out-of-Sample Holdout Benchmark (Tiers 0–3 on held-out `test_df` only).
+    3. Verified static and calendar arbitrage checks across the calibrated SVI surface.
     """
-    print("\n" + "=" * 65)
-    print("      DERIBIT BTC OPTIONS: 4-TIER QUANTITATIVE BENCHMARK REPORT")
-    print("=" * 65)
+    print("\n" + "=" * 72)
+    print("        DERIBIT BTC OPTIONS: 4-TIER QUANTITATIVE BENCHMARK REPORT")
+    print("=" * 72)
 
-    n_contracts = len(df)
-    n_expiries = df['expiry_str'].nunique() if 'expiry_str' in df.columns else df['T'].nunique()
-    spot_mean = df['underlying_price'].mean()
-    market_mid_mean = df['market_mid'].mean()
+    n_full = len(full_df)
+    n_test = len(test_df)
+    n_expiries = full_df["expiry_str"].nunique() if "expiry_str" in full_df.columns else full_df["T"].nunique()
 
-    print(f"Total BTC Contracts Evaluated : {n_contracts}")
-    print(f"Distinct Expiration Slices    : {n_expiries}")
-    print(f"Mean Underlying Forward Price : ${spot_mean:,.2f}")
-    print(f"Mean Market Option Mid Price  : ${market_mid_mean:,.2f}")
-    print("-" * 65)
+    print(f"Total BTC Contracts (Full Surface) : {n_full} across {n_expiries} expiries")
+    print(f"Strict Out-of-Sample Holdout Size  : {n_test} contracts (stratified across expiries)")
+    print(f"Mean Underlying Forward Price      : ${full_df['underlying_price'].mean():,.2f}")
+    print("-" * 72)
 
-    # 1. Volatility Space Metrics (RMSVE)
-    market_iv = df['implied_vol'].values
+    # 1. Full-surface analytical evaluation vs. mark_usd and market_mid
+    full_specs = [
+        ("Tier 0: Naive BS (r=0.05, 40% vol)", "_CONST_40", "bs_legacy_price"),
+        ("Tier 1: Black-76 Flat ATM Vol", "atm_iv", "b76_flat_price"),
+        ("Tier 2: SVI Volatility Surface", "svi_iv", "svi_price"),
+    ]
+    full_vs_mark = _evaluate_tier_frame(full_df, full_specs, "mark_usd")
+    full_vs_mid = _evaluate_tier_frame(full_df, full_specs, "market_mid")
 
-    # Flat ATM vol per expiry slice
-    flat_atm_iv = df.groupby('expiry_str')['implied_vol'].transform(
-        lambda s: s.iloc[np.argmin(np.abs(df.loc[s.index, 'log_moneyness']))]
-    ).values
+    print("\n[1] FULL-SURFACE ANALYTICAL CALIBRATION (N = {}):".format(n_full))
+    for label, _, _ in full_specs:
+        m_mark = full_vs_mark[label]
+        m_mid = full_vs_mid[label]
+        print(
+            f"  {label:<34} | RMSVE={m_mark['rmsve_pct']:5.2f}% | "
+            f"Mark RMSE=${m_mark['rmse_usd']:7.2f} | Mid RMSE=${m_mid['rmse_usd']:7.2f}"
+        )
 
-    svi_iv = df['svi_iv'].values
-    hybrid_iv = df['hybrid_iv'].values if 'hybrid_iv' in df.columns else svi_iv
+    # 2. Strict Out-of-Sample evaluation (including Tier 3 XGBoost)
+    oos_specs = full_specs + [
+        ("Tier 3: Full Hybrid Engine (OOS)", "hybrid_iv", "hybrid_price"),
+    ]
+    oos_vs_mark = _evaluate_tier_frame(test_df, oos_specs, "mark_usd")
+    oos_vs_mid = _evaluate_tier_frame(test_df, oos_specs, "market_mid")
 
-    vol_metrics = {
-        "Tier 0: Naive Constant (40%)": compute_rmse(market_iv, np.full_like(market_iv, 0.40)) * 100.0,
-        "Tier 1: Black-76 Flat ATM Vol": compute_rmse(market_iv, flat_atm_iv) * 100.0,
-        "Tier 2: SVI Volatility Surface": compute_rmse(market_iv, svi_iv) * 100.0,
-        "Tier 3: Full Hybrid Engine": compute_rmse(market_iv, hybrid_iv) * 100.0,
-    }
+    print("\n[2] STRICT OUT-OF-SAMPLE HOLDOUT BENCHMARK (N = {}, Stratified Test Set):".format(n_test))
+    for label, _, _ in oos_specs:
+        m_mark = oos_vs_mark[label]
+        m_mid = oos_vs_mid[label]
+        print(
+            f"  {label:<34} | RMSVE={m_mark['rmsve_pct']:5.2f}% | "
+            f"Mark RMSE=${m_mark['rmse_usd']:7.2f} (MAPE {m_mark['mape_pct']:5.2f}%) | "
+            f"Mid RMSE=${m_mid['rmse_usd']:7.2f}"
+        )
 
-    print("\n[1] VOLATILITY SURFACE ACCURACY (RMSVE in % vol points, lower is better):")
-    for name, val in vol_metrics.items():
-        print(f"  {name:<35} : {val:6.2f}%")
+    # 3. Real, verified arbitrage audits (not hardcoded text)
+    n_slices = len(calibrated_models)
+    n_bfly_ok = sum(1 for v in calibrated_models.values() if v.get("is_butterfly_free", False))
+    n_rl_ok = sum(1 for v in calibrated_models.values() if v.get("is_roger_lee_valid", False))
+    min_density = min((v["min_density"] for v in calibrated_models.values()), default=0.0)
+    cal_free, min_cal_diff, cal_violations = check_calendar_arbitrage(calibrated_models)
 
-    # 2. Dollar Space Pricing Metrics
-    market_price = df['market_mid'].values
-    t0_price = df['bs_legacy_price'].values if 'bs_legacy_price' in df.columns else df['bs_baseline_price'].values
-    t1_price = df['b76_flat_price'].values
-    t2_price = df['svi_price'].values
-    t3_price = df['hybrid_price'].values if 'hybrid_price' in df.columns else t2_price
-
-    price_rmse = {
-        "Tier 0: Naive BS (r=0.05, 40% vol)": compute_rmse(market_price, t0_price),
-        "Tier 1: Black-76 Flat ATM Vol": compute_rmse(market_price, t1_price),
-        "Tier 2: SVI Volatility Surface": compute_rmse(market_price, t2_price),
-        "Tier 3: Full Hybrid Engine": compute_rmse(market_price, t3_price),
-    }
-
-    price_mape = {
-        "Tier 0: Naive BS (r=0.05, 40% vol)": compute_mape(market_price, t0_price),
-        "Tier 1: Black-76 Flat ATM Vol": compute_mape(market_price, t1_price),
-        "Tier 2: SVI Volatility Surface": compute_mape(market_price, t2_price),
-        "Tier 3: Full Hybrid Engine": compute_mape(market_price, t3_price),
-    }
-
-    print("\n[2] DOLLAR PRICING ACCURACY (RMSE in USD & MAPE in %):")
-    for name in price_rmse:
-        print(f"  {name:<35} : RMSE = ${price_rmse[name]:8.2f}  |  MAPE = {price_mape[name]:5.2f}%")
-
-    # 3. Arbitrage Violations
-    print("\n[3] NO-ARBITRAGE GUARANTEES:")
-    print("  Tier 0 (Naive BS)   : Calendar violations present due to r=0.05 cash discounting")
-    print("  Tier 1 (Flat ATM)   : No butterfly arbitrage, but flat smile ignores market skew")
-    print("  Tier 2 (SVI Surface): 100% Guaranteed No-Butterfly & No-Calendar Arbitrage")
-    print("  Tier 3 (Hybrid)     : Microstructure-informed correction around SVI manifold")
-
-    print("=" * 65)
+    print("\n[3] VERIFIED SVI NO-ARBITRAGE AUDIT (k in [-1.0, +1.0]):")
+    print(f"  Butterfly Density (g(k) >= 0) : {n_bfly_ok}/{n_slices} slices pass (min g = {min_density:.6f})")
+    print(f"  Roger Lee Moment Bound        : {n_rl_ok}/{n_slices} slices pass")
+    print(f"  Calendar Monotonicity         : {'PASS (0 violations)' if cal_free else f'FAIL ({len(cal_violations)} violations)'} (min dw = {min_cal_diff:.6f})")
+    print("=" * 72)
 
     return {
-        "vol_rmsve": vol_metrics,
-        "price_rmse": price_rmse,
-        "price_mape": price_mape
+        "full_vs_mark": full_vs_mark,
+        "full_vs_mid": full_vs_mid,
+        "oos_vs_mark": oos_vs_mark,
+        "oos_vs_mid": oos_vs_mid,
+        "vol_rmsve": {k: v["rmsve_pct"] for k, v in oos_vs_mark.items()},
+        "price_rmse": {k: v["rmse_usd"] for k, v in oos_vs_mark.items()},
+        "price_mape": {k: v["mape_pct"] for k, v in oos_vs_mark.items()},
+        "arbitrage": {
+            "butterfly_passed": n_bfly_ok,
+            "roger_lee_passed": n_rl_ok,
+            "total_slices": n_slices,
+            "min_density": min_density,
+            "calendar_free": cal_free,
+            "min_calendar_diff": min_cal_diff,
+            "calendar_violations": len(cal_violations),
+        },
     }
-
-
-def run_sanity_checks(df: pd.DataFrame):
-    """
-    Backward-compatible wrapper for sanity checks.
-    """
-    return run_four_tier_sanity_checks(df)
