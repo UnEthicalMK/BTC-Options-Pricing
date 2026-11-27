@@ -1,6 +1,13 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "btc-option-pricing"
+version = "0.2.0"
+description = "Deribit BTC Options pricing engine using Black-76, Gatheral SVI, and XGBoost microstructure residuals."
+readme = "README.md"
+requires-python = ">=3.10"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
