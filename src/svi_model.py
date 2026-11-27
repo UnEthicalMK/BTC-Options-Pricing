@@ -1,33 +1,17 @@
 import numpy as np
 import pandas as pd
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, minimize
 from src import config
+from src.baseline import price_options_dataframe
 
 
 def svi_raw(k, a, b, rho, m, sigma):
     """
-    Gatheral's Raw SVI (Stochastic Volatility Inspired) total implied variance:
+    Gatheral's Raw SVI total implied variance:
         w(k) = a + b * (rho * (k - m) + sqrt((k - m)^2 + sigma^2))
-
-    Parameters
-    ----------
-    k : float or np.ndarray
-        Log-moneyness: k = ln(K / F)
-    a, b, rho, m, sigma : float
-        SVI parameters:
-        a: vertical shift (variance level)
-        b: wing angle (curvature)
-        rho: smile orientation / skew (-1 < rho < 1)
-        m: horizontal translation of smile minimum
-        sigma: smoothness of the ATM vertex (sigma > 0)
-
-    Returns
-    -------
-    np.ndarray
-        Total implied variance w(k) = sigma_IV^2 * T
     """
     k = np.asarray(k, dtype=float)
-    disc = np.sqrt((k - m)**2 + sigma**2)
+    disc = np.sqrt((k - m) ** 2 + sigma ** 2)
     return a + b * (rho * (k - m) + disc)
 
 
@@ -35,21 +19,20 @@ def svi_implied_vol(k, T, a, b, rho, m, sigma):
     """
     Converts SVI total variance w(k) to annualized implied volatility:
         sigma_IV = sqrt(max(w(k), 1e-6) / T)
+    Supports both scalar and array-like inputs for k and T.
     """
     w = svi_raw(k, a, b, rho, m, sigma)
     w_safe = np.maximum(w, 1e-6)
-    T_safe = np.maximum(float(T), 1e-6)
+    T_safe = np.maximum(np.asarray(T, dtype=float), 1e-6)
     return np.sqrt(w_safe / T_safe)
 
 
 def check_svi_arbitrage_bounds(a, b, rho, m, sigma, T):
     """
-    Validates Gatheral's static no-arbitrage parameter bounds:
-    1. b >= 0
-    2. |rho| < 1
-    3. sigma > 0
-    4. a + b * sigma * sqrt(1 - rho^2) >= 0 (strictly positive total variance)
-    5. b * (1 + |rho|) < 4 / T (Roger Lee's moment formula bound)
+    Validates Gatheral's static parameter bounds and Roger Lee's moment bound:
+    1. b >= 0, |rho| < 1, sigma > 0
+    2. a + b * sigma * sqrt(1 - rho^2) >= 0 (non-negative total variance)
+    3. b * (1 + |rho|) < 4 / T (Roger Lee asymptotic slope bound)
     """
     if b < 0:
         return False, "b must be non-negative"
@@ -57,7 +40,7 @@ def check_svi_arbitrage_bounds(a, b, rho, m, sigma, T):
         return False, "|rho| must be strictly less than 1"
     if sigma <= 0:
         return False, "sigma must be strictly positive"
-    min_w = a + b * sigma * np.sqrt(max(1.0 - rho**2, 1e-6))
+    min_w = a + b * sigma * np.sqrt(max(1.0 - rho ** 2, 1e-6))
     if min_w < 0:
         return False, f"Minimum total variance is negative ({min_w:.4f} < 0)"
     if b * (1.0 + abs(rho)) >= 4.0 / max(float(T), 1e-4):
@@ -67,81 +50,128 @@ def check_svi_arbitrage_bounds(a, b, rho, m, sigma, T):
 
 def check_butterfly_arbitrage(k_grid, T, a, b, rho, m, sigma):
     """
-    Evaluates Breeden-Litzenberger risk-neutral density g(k):
+    Evaluates Breeden-Litzenberger risk-neutral density factor g(k):
         g(k) = (1 - k*w'/(2w))^2 - (w'^2 / 4)*(1/w + 1/4) + w''/2
-    Arbitrage-free condition requires g(k) >= 0 across all k.
+    Strict no-butterfly-arbitrage requires g(k) >= 0 across all k.
     """
     k = np.asarray(k_grid, dtype=float)
     w = np.maximum(svi_raw(k, a, b, rho, m, sigma), 1e-6)
-    
-    # First derivative w'(k)
-    disc = np.sqrt((k - m)**2 + sigma**2)
+
+    disc = np.sqrt((k - m) ** 2 + sigma ** 2)
     w_prime = b * (rho + (k - m) / disc)
-    
-    # Second derivative w''(k)
-    w_prime2 = b * (sigma**2 / (disc**3))
-    
-    # Breeden-Litzenberger g(k)
-    term1 = (1.0 - (k * w_prime) / (2.0 * w))**2
-    term2 = (w_prime**2 / 4.0) * (1.0 / w + 0.25)
+    w_prime2 = b * (sigma ** 2 / (disc ** 3))
+
+    term1 = (1.0 - (k * w_prime) / (2.0 * w)) ** 2
+    term2 = (w_prime ** 2 / 4.0) * (1.0 / w + 0.25)
     term3 = 0.5 * w_prime2
-    
+
     g = term1 - term2 + term3
-    is_arbitrage_free = bool(np.all(g >= -1e-4))
     min_density = float(np.min(g))
-    return is_arbitrage_free, min_density, g
+    return bool(min_density >= 0.0), min_density, g
 
 
-def calibrate_svi_slice(k_array, iv_array, T):
+def check_calendar_arbitrage(calibrated_models: dict, k_grid: np.ndarray = None):
     """
-    Calibrates SVI parameters (a, b, rho, m, sigma) for a single maturity slice.
-    Minimizes Root Mean Squared Volatility Error (RMSVE) directly in IV space.
-
-    Parameters
-    ----------
-    k_array : np.ndarray
-        Array of log-moneyness values: k = ln(K / F)
-    iv_array : np.ndarray
-        Market implied volatilities (decimal, e.g. 0.65)
-    T : float
-        Maturity in fractional years.
+    Checks calendar spread monotonicity across sorted expiries (T_1 < T_2 < ...):
+        w(k, T_{i+1}) >= w(k, T_i)  for all k in k_grid.
 
     Returns
     -------
-    dict
-        Fitted parameters, RMSVE, and arbitrage verification flag.
+    tuple[bool, float, list[dict]]
+        (is_calendar_free, min_variance_diff, violation_records)
+    """
+    if k_grid is None:
+        k_grid = np.linspace(config.SVI_ARB_K_GRID_MIN, config.SVI_ARB_K_GRID_MAX, 121)
+
+    ordered = sorted(calibrated_models.items(), key=lambda item: item[1]["T"])
+    prev_exp = None
+    prev_w = None
+    min_diff = 0.0
+    violations = []
+
+    for exp, res in ordered:
+        p = res["params"]
+        cur_w = svi_raw(k_grid, p["a"], p["b"], p["rho"], p["m"], p["sigma"])
+        if prev_w is not None:
+            diff = float(np.min(cur_w - prev_w))
+            min_diff = min(min_diff, diff) if violations or prev_exp != ordered[0][0] else diff
+            if diff < 0.0:
+                violations.append({
+                    "prev_expiry": prev_exp,
+                    "expiry": exp,
+                    "min_diff": diff,
+                })
+        prev_exp = exp
+        prev_w = cur_w
+
+    return len(violations) == 0, float(min_diff), violations
+
+
+def calibrate_svi_slice(k_array, iv_array, T, prev_w_grid=None, k_grid=None):
+    """
+    Calibrates SVI parameters (a, b, rho, m, sigma) for a single maturity slice.
+    Uses robust least-squares initialization followed by SLSQP constraint polish
+    when needed to enforce strict butterfly, Roger Lee, and calendar bounds.
     """
     k = np.asarray(k_array, dtype=float)
     iv = np.asarray(iv_array, dtype=float)
     T = max(float(T), 1e-5)
-    w_market = (iv**2) * T
+    w_market = (iv ** 2) * T
+
+    if k_grid is None:
+        k_grid = np.linspace(config.SVI_ARB_K_GRID_MIN, config.SVI_ARB_K_GRID_MAX, 121)
 
     atm_idx = np.argmin(np.abs(k))
     atm_w = float(w_market[atm_idx])
-    
-    # Well-scaled initial parameter heuristic
+
     x0 = [atm_w * 0.8, 0.02, -0.2, 0.0, 0.05]
-    # Bound a based on maturity T to prevent negative total variance
     bounds = (
         [-2.0 * T - 0.01, 0.0001, -0.999, -1.0, 0.0001],
-        [5.0,            3.0,     0.999,  1.0, 2.0]
+        [5.0,             3.0,     0.999,  1.0, 2.0],
     )
 
     res = least_squares(
         lambda p: svi_implied_vol(k, T, *p) - iv,
         x0=x0,
         bounds=bounds,
-        loss='soft_l1',
+        loss="soft_l1",
         f_scale=0.02,
-        max_nfev=1500
+        max_nfev=1500,
     )
+    opt_p = res.x
 
-    a_opt, b_opt, rho_opt, m_opt, sigma_opt = res.x
+    # Verify static and cross-slice arbitrage conditions across k_grid
+    is_bfly, min_g, _ = check_butterfly_arbitrage(k_grid, T, *opt_p)
+    rl_ok, _ = check_svi_arbitrage_bounds(*opt_p, T)
+    cal_ok = True
+    if prev_w_grid is not None:
+        cal_ok = bool(np.min(svi_raw(k_grid, *opt_p) - prev_w_grid) >= 0.0)
+
+    if not (is_bfly and rl_ok and cal_ok):
+        cons = [
+            {"type": "ineq", "fun": lambda p: check_butterfly_arbitrage(k_grid, T, *p)[1] - 1e-5},
+            {"type": "ineq", "fun": lambda p: p[0] + p[1] * p[4] * np.sqrt(max(1.0 - p[2] ** 2, 1e-6)) - 1e-6},
+            {"type": "ineq", "fun": lambda p: (4.0 / max(T, 1e-4)) - p[1] * (1.0 + abs(p[2])) - 1e-4},
+        ]
+        if prev_w_grid is not None:
+            pw = prev_w_grid.copy()
+            cons.append({"type": "ineq", "fun": lambda p, pw=pw: np.min(svi_raw(k_grid, *p) - pw) - 1e-6})
+
+        res_c = minimize(
+            lambda p: np.mean((svi_implied_vol(k, T, *p) - iv) ** 2),
+            x0=opt_p,
+            method="SLSQP",
+            bounds=list(zip(bounds[0], bounds[1])),
+            constraints=cons,
+            options={"maxiter": 500, "ftol": 1e-9},
+        )
+        opt_p = res_c.x
+        is_bfly, min_g, _ = check_butterfly_arbitrage(k_grid, T, *opt_p)
+        rl_ok, _ = check_svi_arbitrage_bounds(*opt_p, T)
+
+    a_opt, b_opt, rho_opt, m_opt, sigma_opt = opt_p
     iv_fitted = svi_implied_vol(k, T, a_opt, b_opt, rho_opt, m_opt, sigma_opt)
-    rmsve = float(np.sqrt(np.mean((iv - iv_fitted)**2)))
-
-    fine_k = np.linspace(min(k.min() - 0.1, -0.5), max(k.max() + 0.1, 0.5), 150)
-    is_arb_free, min_g, _ = check_butterfly_arbitrage(fine_k, T, a_opt, b_opt, rho_opt, m_opt, sigma_opt)
+    rmsve = float(np.sqrt(np.mean((iv - iv_fitted) ** 2)))
 
     return {
         "params": {
@@ -152,67 +182,49 @@ def calibrate_svi_slice(k_array, iv_array, T):
             "sigma": float(sigma_opt),
         },
         "rmsve": rmsve,
-        "is_arbitrage_free": is_arb_free,
+        "is_arbitrage_free": bool(is_bfly and rl_ok),
+        "is_butterfly_free": is_bfly,
+        "is_roger_lee_valid": rl_ok,
         "min_density": min_g,
         "T": T,
-        "n_points": len(k)
+        "n_points": len(k),
     }
 
 
 def calibrate_svi_surface(df: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
     """
-    Calibrates SVI smiles across all active maturity slices in the dataset.
-    Adds 'svi_iv' and 'svi_price' to the input DataFrame.
+    Calibrates SVI smiles sequentially from shortest to longest maturity,
+    enforcing butterfly and calendar arbitrage constraints across the grid.
     """
     df = df.copy()
-    df['svi_iv'] = np.nan
-    df['svi_price'] = np.nan
+    df["svi_iv"] = np.nan
 
     calibrated_models = {}
-    expiries = df['expiry_str'].unique() if 'expiry_str' in df.columns else df['T'].unique()
+    group_col = "expiry_str" if "expiry_str" in df.columns else "T"
+    expiries = df.groupby(group_col)["T"].first().sort_values().index.tolist()
 
-    from src.baseline import vectorized_black_76
+    k_grid = np.linspace(config.SVI_ARB_K_GRID_MIN, config.SVI_ARB_K_GRID_MAX, 121)
+    prev_w_grid = None
 
     for exp in expiries:
-        mask = (df['expiry_str'] == exp) if 'expiry_str' in df.columns else (df['T'] == exp)
+        mask = df[group_col] == exp
         sub = df[mask]
         if len(sub) < 4:
-            df.loc[mask, 'svi_iv'] = sub['implied_vol'].median()
+            df.loc[mask, "svi_iv"] = sub["implied_vol"].median()
             continue
 
-        T_val = sub['T'].iloc[0]
-        k_vals = sub['log_moneyness'].values
-        iv_vals = sub['implied_vol'].values
+        T_val = float(sub["T"].iloc[0])
+        k_vals = sub["log_moneyness"].values
+        iv_vals = sub["implied_vol"].values
 
-        fit_result = calibrate_svi_slice(k_vals, iv_vals, T_val)
-        p = fit_result['params']
+        fit_result = calibrate_svi_slice(k_vals, iv_vals, T_val, prev_w_grid=prev_w_grid, k_grid=k_grid)
+        p = fit_result["params"]
         calibrated_models[str(exp)] = fit_result
 
-        # Predict SVI IV
-        fitted_iv = svi_implied_vol(k_vals, T_val, p['a'], p['b'], p['rho'], p['m'], p['sigma'])
-        df.loc[mask, 'svi_iv'] = fitted_iv
+        df.loc[mask, "svi_iv"] = svi_implied_vol(
+            k_vals, T_val, p["a"], p["b"], p["rho"], p["m"], p["sigma"]
+        )
+        prev_w_grid = svi_raw(k_grid, p["a"], p["b"], p["rho"], p["m"], p["sigma"])
 
-        # Predict Black-76 SVI Option Price
-        call_mask = mask & (df['option_type'].str.lower() == 'call')
-        put_mask = mask & (df['option_type'].str.lower() == 'put')
-
-        if call_mask.any():
-            c_sub = df[call_mask]
-            df.loc[call_mask, 'svi_price'] = vectorized_black_76(
-                F=c_sub['underlying_price'].values,
-                K=c_sub['strike'].values,
-                T=c_sub['T'].values,
-                sigma=df.loc[call_mask, 'svi_iv'].values,
-                option_type='call'
-            )
-        if put_mask.any():
-            p_sub = df[put_mask]
-            df.loc[put_mask, 'svi_price'] = vectorized_black_76(
-                F=p_sub['underlying_price'].values,
-                K=p_sub['strike'].values,
-                T=p_sub['T'].values,
-                sigma=df.loc[put_mask, 'svi_iv'].values,
-                option_type='put'
-            )
-
+    df["svi_price"] = price_options_dataframe(df, df["svi_iv"].values, model="black_76")
     return calibrated_models, df
