@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from scipy.stats import norm
 
 
@@ -6,24 +7,6 @@ def vectorized_black_76(F, K, T, sigma, option_type="call"):
     """
     Computes analytical European option prices under the Black-76 model (r = 0),
     matching Deribit's inverse coin-margined forward pricing conventions.
-
-    Parameters
-    ----------
-    F : float or np.ndarray
-        Underlying forward/futures price for the option expiry.
-    K : float or np.ndarray
-        Strike price of the option contract.
-    T : float or np.ndarray
-        Time to maturity in fractional years.
-    sigma : float or np.ndarray
-        Annualized volatility (decimal, e.g. 0.65 for 65%).
-    option_type : str
-        'call' or 'put'.
-
-    Returns
-    -------
-    np.ndarray
-        Option price in USD. (Divide by F to convert to BTC premium).
     """
     F = np.asarray(F, dtype=float)
     K = np.asarray(K, dtype=float)
@@ -46,11 +29,7 @@ def vectorized_black_76(F, K, T, sigma, option_type="call"):
 
 def calculate_black_76_greeks(F, K, T, sigma, option_type="call"):
     """
-    Computes forward Delta, Gamma, and Vega under Black-76 (r=0).
-
-    Returns
-    -------
-    delta, gamma, vega : tuple of np.ndarray
+    Computes forward Delta, Gamma, and Vega under Black-76 (r = 0).
     """
     F = np.asarray(F, dtype=float)
     K = np.asarray(K, dtype=float)
@@ -74,9 +53,6 @@ def calculate_black_76_greeks(F, K, T, sigma, option_type="call"):
     return delta, gamma, vega
 
 
-# -------------------------------------------------------------------------
-# Legacy Black-Scholes implementation (retained for baseline comparisons)
-# -------------------------------------------------------------------------
 def vectorized_black_scholes(S, K, T, r, sigma, option_type="call"):
     """
     Classical Black-Scholes spot formula with cash discounting (r > 0).
@@ -101,27 +77,53 @@ def vectorized_black_scholes(S, K, T, r, sigma, option_type="call"):
     return np.maximum(price, 0.0)
 
 
-def calculate_greeks(S, K, T, r, sigma, option_type="call"):
+def price_options_dataframe(
+    df: pd.DataFrame,
+    sigma: np.ndarray | float,
+    model: str = "black_76",
+    r: float = 0.0,
+) -> np.ndarray:
     """
-    Classical spot Black-Scholes Greeks with cash interest rate.
+    Prices mixed call/put rows in an options DataFrame using a unified code path.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain 'underlying_price', 'strike', 'T', and 'option_type'.
+    sigma : float or array-like
+        Annualized volatility matching `df` length (or scalar).
+    model : str
+        'black_76' (default, r=0) or 'black_scholes' (legacy cash discounting).
+    r : float
+        Risk-free rate used only when model == 'black_scholes'.
     """
-    S = np.asarray(S, dtype=float)
-    K = np.asarray(K, dtype=float)
-    T = np.maximum(np.asarray(T, dtype=float), 1e-5)
-    sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-5)
+    sigma_arr = np.broadcast_to(np.asarray(sigma, dtype=float), len(df))
+    prices = np.empty(len(df), dtype=float)
+    otypes = df["option_type"].str.lower()
 
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    for otype in ("call", "put"):
+        mask = (otypes == otype).values
+        if not np.any(mask):
+            continue
+        sub = df.iloc[mask]
+        if model == "black_76":
+            prices[mask] = vectorized_black_76(
+                F=sub["underlying_price"].values,
+                K=sub["strike"].values,
+                T=sub["T"].values,
+                sigma=sigma_arr[mask],
+                option_type=otype,
+            )
+        elif model == "black_scholes":
+            prices[mask] = vectorized_black_scholes(
+                S=sub["underlying_price"].values,
+                K=sub["strike"].values,
+                T=sub["T"].values,
+                r=r,
+                sigma=sigma_arr[mask],
+                option_type=otype,
+            )
+        else:
+            raise ValueError(f"Unsupported pricing model: {model}")
 
-    pdf_d1 = norm.pdf(d1)
-    gamma = pdf_d1 / (S * sigma * np.sqrt(T))
-    vega = S * np.sqrt(T) * pdf_d1
-
-    otype = option_type.lower()
-    if otype == "call":
-        delta = norm.cdf(d1)
-    elif otype == "put":
-        delta = norm.cdf(d1) - 1.0
-    else:
-        raise ValueError("option_type must be either 'call' or 'put'")
-
-    return delta, gamma, vega
+    return prices
